@@ -1,5 +1,5 @@
 {
-  "name": "pino-sentry-transport",
+  "name": "@arthurfiorette/pino-sentry-transport",
   "version": "1.5.0",
   "description": "Integrates Pino and Sentry.",
   "author": "Tomer Yechiel",
