@@ -1,5 +1,5 @@
-import type { Transform } from "node:stream";
-import type { Scope } from "@sentry/core";
+import type { Transform } from 'node:stream';
+import type { Scope } from '@sentry/core';
 import {
   type NodeOptions,
   type SeverityLevel,
@@ -8,27 +8,45 @@ import {
   captureMessage,
   getClient,
   init,
-} from "@sentry/node";
-import get from "lodash.get";
-import build from "pino-abstract-transport";
+  logger
+} from '@sentry/node';
+import get from 'lodash.get';
+import build from 'pino-abstract-transport';
+import { writeFileSync } from 'node:fs';
 
 const pinoLevelToSentryLevel = (level: number): SeverityLevel => {
   if (level === 60) {
-    return "fatal";
+    return 'fatal';
   }
   if (level >= 50) {
-    return "error";
+    return 'error';
   }
   if (level >= 40) {
-    return "warning";
+    return 'warning';
   }
   if (level >= 30) {
-    return "log";
+    return 'log';
   }
   if (level >= 20) {
-    return "info";
+    return 'info';
   }
-  return "debug";
+  return 'debug';
+};
+
+const pinoLevelToSentryKey = (level: number): keyof typeof logger => {
+  if (level === 60) {
+    return 'fatal';
+  }
+  if (level >= 50) {
+    return 'error';
+  }
+  if (level >= 40) {
+    return 'warn';
+  }
+  if (level >= 20) {
+    return 'info';
+  }
+  return 'debug';
 };
 
 function deserializePinoError(pinoErr) {
@@ -51,13 +69,14 @@ interface PinoSentryOptions {
 
   expectPinoConfig: boolean;
   sendBreadcrumbs: boolean;
+  useSentryLogger: boolean;
 }
 
 const defaultOptions: Partial<PinoSentryOptions> = {
   minLevel: 10,
   withLogRecord: false,
   skipSentryInitialization: false,
-  expectPinoConfig: false,
+  expectPinoConfig: false
 };
 
 export default async function (initSentryOptions: Partial<PinoSentryOptions>) {
@@ -67,14 +86,21 @@ export default async function (initSentryOptions: Partial<PinoSentryOptions>) {
   const isInitialized = !!client;
 
   if (!isInitialized) {
+    if (initSentryOptions.useSentryLogger) {
+      pinoSentryOptions.sentry._experiments ??= {};
+      pinoSentryOptions.sentry._experiments.enableLogs = true;
+    }
+
     init(pinoSentryOptions.sentry);
   }
+
+  writeFileSync('/tmp/debug', JSON.stringify(pinoSentryOptions, null, 2), 'utf8');
 
   function enrichScope(scope: Scope, pinoEvent) {
     scope.setLevel(pinoLevelToSentryLevel(pinoEvent.level));
 
     if (pinoSentryOptions.withLogRecord) {
-      scope.setContext("pino-log-record", pinoEvent);
+      scope.setContext('pino-log-record', pinoEvent);
     }
 
     if (pinoSentryOptions.tags?.length) {
@@ -88,7 +114,7 @@ export default async function (initSentryOptions: Partial<PinoSentryOptions>) {
       for (const c of pinoSentryOptions.context) {
         context[c] = get(pinoEvent, c);
       }
-      scope.setContext("pino-context", context);
+      scope.setContext('pino-context', context);
     }
 
     return scope;
@@ -96,48 +122,60 @@ export default async function (initSentryOptions: Partial<PinoSentryOptions>) {
 
   return build(
     async (
-      source: Transform &
-        build.OnUnknown & { errorKey?: string; messageKey?: string },
+      source: Transform & build.OnUnknown & { errorKey?: string; messageKey?: string }
     ) => {
-      for await (const obj of source) {
-        if (!obj) {
-          return;
-        }
+      try {
+        for await (const obj of source) {
+          if (!obj) {
+            return;
+          }
 
-        const serializedError = obj?.[source.errorKey ?? "err"];
-        const level = obj.level;
+          const serializedError = obj?.[source.errorKey ?? 'err'];
+          const level = obj.level;
 
-        if (level >= pinoSentryOptions.minLevel) {
-          if (serializedError) {
-            if (pinoSentryOptions.sendBreadcrumbs) {
-              addBreadcrumb({
-                type: "error",
-                level: pinoLevelToSentryLevel(level),
-                message: obj?.[source.messageKey ?? "msg"],
-                data: obj,
-              });
+          if (level >= pinoSentryOptions.minLevel) {
+            if (pinoSentryOptions.useSentryLogger) {
+              const { trace_id, ...logData } = obj;
+              const msg = logData[source.messageKey ?? 'msg'];
+              delete logData[source.messageKey ?? 'msg'];
+              if (trace_id) {
+                logData.trace = trace_id;
+              }
+
+              logger[pinoLevelToSentryKey(level)](msg, logData);
+            } else if (serializedError) {
+              if (pinoSentryOptions.sendBreadcrumbs) {
+                addBreadcrumb({
+                  type: 'error',
+                  level: pinoLevelToSentryLevel(level),
+                  message: obj?.[source.messageKey ?? 'msg'],
+                  data: obj
+                });
+              } else {
+                captureException(deserializePinoError(serializedError), (scope) =>
+                  enrichScope(scope, obj)
+                );
+              }
             } else {
-              captureException(deserializePinoError(serializedError), (scope) =>
-                enrichScope(scope, obj),
-              );
-            }
-          } else {
-            if (pinoSentryOptions.sendBreadcrumbs) {
-              addBreadcrumb({
-                type: "default",
-                level: pinoLevelToSentryLevel(level),
-                message: obj?.[source.messageKey ?? "msg"],
-                data: obj,
-              });
-            } else {
-              captureMessage(obj?.[source.messageKey ?? "msg"], (scope) =>
-                enrichScope(scope, obj),
-              );
+              if (pinoSentryOptions.sendBreadcrumbs) {
+                addBreadcrumb({
+                  type: 'default',
+                  level: pinoLevelToSentryLevel(level),
+                  message: obj?.[source.messageKey ?? 'msg'],
+                  data: obj
+                });
+              } else {
+                captureMessage(obj?.[source.messageKey ?? 'msg'], (scope) =>
+                  enrichScope(scope, obj)
+                );
+              }
             }
           }
         }
+      } catch (err) {
+        writeFileSync('/tmp/error', JSON.stringify(err, null, 2), 'utf8');
       }
     },
-    { expectPinoConfig: pinoSentryOptions.expectPinoConfig },
+    { expectPinoConfig: pinoSentryOptions.expectPinoConfig }
   );
 }
